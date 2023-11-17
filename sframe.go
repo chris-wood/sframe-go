@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
@@ -118,9 +119,21 @@ func NewCiphersuite(id uint16) (Ciphersuite, error) {
 		return AesCtr128HmacSha256Tag64Suite{}, nil
 	} else if id == 0x0003 {
 		return AesCtr128HmacSha256Tag32Suite{}, nil
+	} else if id == 0x0004 {
+		return AesGcm128Sha256Tag128Suite{}, nil
+	} else if id == 0x0005 {
+		return AesGcm256Sha512Tag128Suite{}, nil
 	} else {
 		return nil, fmt.Errorf("unsupported ciphersuite")
 	}
+}
+
+type Encryptor interface {
+	Encrypt(key, nonce, aad, plaintext []byte) ([]byte, error)
+	Decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error)
+	Nk() int
+	Nn() int
+	Nt() int
 }
 
 type AesCtr128HmacSha256Tag80Suite struct {
@@ -136,14 +149,6 @@ func (s AesCtr128HmacSha256Tag80Suite) Hash() func() hash.Hash {
 
 func (s AesCtr128HmacSha256Tag80Suite) ID() uint16 {
 	return 0x0001
-}
-
-type Encryptor interface {
-	Encrypt(key, nonce, aad, plaintext []byte) ([]byte, error)
-	Decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error)
-	Nk() int
-	Nn() int
-	Nt() int
 }
 
 // https://sframe-wg.github.io/sframe/draft-ietf-sframe-enc.html#name-cipher-suites
@@ -386,6 +391,130 @@ func (e AesCtr128HmacSha256Tag32Encryptor) Nn() int {
 
 func (e AesCtr128HmacSha256Tag32Encryptor) Nt() int {
 	return 4
+}
+
+type AesGcm128Sha256Tag128Suite struct {
+}
+
+// https://sframe-wg.github.io/sframe/draft-ietf-sframe-enc.html#name-cipher-suites
+type AesGcm128Sha256Tag128Encryptor struct {
+}
+
+func (s AesGcm128Sha256Tag128Suite) AEAD() Encryptor {
+	return AesGcm128Sha256Tag128Encryptor{}
+}
+
+func (s AesGcm128Sha256Tag128Suite) Hash() func() hash.Hash {
+	return sha256.New
+}
+
+func (s AesGcm128Sha256Tag128Suite) ID() uint16 {
+	return 0x0004
+}
+
+func (e AesGcm128Sha256Tag128Encryptor) Encrypt(key, nonce, aad, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	ciphertext := aesgcm.Seal(nil, nonce, plaintext, aad)
+
+	return ciphertext, nil
+}
+
+func (e AesGcm128Sha256Tag128Encryptor) Decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	plaintext, err := aesgcm.Open(nil, nonce, ciphertext, aad)
+	return plaintext, err
+}
+
+func (e AesGcm128Sha256Tag128Encryptor) Nk() int {
+	return 16
+}
+
+func (e AesGcm128Sha256Tag128Encryptor) Nn() int {
+	return 12
+}
+
+func (e AesGcm128Sha256Tag128Encryptor) Nt() int {
+	return 16
+}
+
+type AesGcm256Sha512Tag128Suite struct {
+}
+
+// https://sframe-wg.github.io/sframe/draft-ietf-sframe-enc.html#name-cipher-suites
+type AesGcm256Sha256Tag128Encryptor struct {
+}
+
+func (s AesGcm256Sha512Tag128Suite) AEAD() Encryptor {
+	return AesGcm256Sha256Tag128Encryptor{}
+}
+
+func (s AesGcm256Sha512Tag128Suite) Hash() func() hash.Hash {
+	return sha512.New
+}
+
+func (s AesGcm256Sha512Tag128Suite) ID() uint16 {
+	return 0x0005
+}
+
+func (e AesGcm256Sha256Tag128Encryptor) Encrypt(key, nonce, aad, plaintext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	ciphertext := aesgcm.Seal(nil, nonce, plaintext, aad)
+
+	return ciphertext, nil
+}
+
+func (e AesGcm256Sha256Tag128Encryptor) Decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	plaintext, err := aesgcm.Open(nil, nonce, ciphertext, aad)
+	return plaintext, err
+}
+
+func (e AesGcm256Sha256Tag128Encryptor) Nk() int {
+	return 32
+}
+
+func (e AesGcm256Sha256Tag128Encryptor) Nn() int {
+	return 12
+}
+
+func (e AesGcm256Sha256Tag128Encryptor) Nt() int {
+	return 16
 }
 
 type SFramerKey struct {

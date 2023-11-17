@@ -116,40 +116,87 @@ func TestAeadRoundTrip(t *testing.T) {
 
 // https://sframe-wg.github.io/sframe/draft-ietf-sframe-enc.html#name-sframe-encryption-decryptio
 func TestSFrameRoundTrip(t *testing.T) {
-	// cipher_suite: 0x0001
-	kidHex := "0000000000000123"
-	ctrHex := "0000000000004567"
-	baseKeyHex := "000102030405060708090a0b0c0d0e0f"
-	// sframeKeyLabel := "534672616d6520312e3020536563726574206b65792000000000000001230001"
-	// sframeSaltLabel := "534672616d6520312e30205365637265742073616c742000000000000001230001"
-	// sframeSecret := "d926952ca8b7ec4a95941d1ada3a5203ceff8cceee34f574d23909eb314c40c0"
-	// sframeKey := "3f7d9a7c83ae8e1c8a11ae695ab59314b367e359fadac7b9c46b2bc6f81f46e16b96f0811868d59402b7e870102720b3"
-	// sframeSalt := "50b29329a04dc0f184ac3168"
-	metadataHex := "4945544620534672616d65205747"
-	// nonce := "50b29329a04dc0f184ac740f"
-	// aad := "99012345674945544620534672616d65205747"
-	plaintextHex := "64726166742d696574662d736672616d652d656e63"
-	ciphertextHex := "9901234567449408b6f490086165b9d6f62b24ae1a59a56486b4ae8ed036b88912e24f11"
 
-	kid := mustDecodeHexInt(kidHex)
-	ctr := mustDecodeHexInt(ctrHex)
-	baseKey := mustDecodeHex(baseKeyHex)
-	metadata := mustDecodeHex(metadataHex)
-	plaintext := mustDecodeHex(plaintextHex)
-	ciphertext := mustDecodeHex(ciphertextHex)
-
-	suite := AesCtr128HmacSha256Tag80Suite{}
-
-	var err error
-	kidMap := make(map[uint64]SFramerKey)
-	kidMap[kid], err = NewSFramerKey(kid, baseKey, suite)
-	require.Nil(t, err, "NewSFramerKey failed")
-	sframer := SFramer{
-		suite:    suite,
-		keyStore: kidMap,
+	var testVectors = []struct {
+		cipherSuite   uint16
+		kidHex        string
+		ctrHex        string
+		baseKeyHex    string
+		metadataHex   string
+		plaintextHex  string
+		ciphertextHex string
+	}{
+		{
+			cipherSuite:   0x0001,
+			kidHex:        "0000000000000123",
+			ctrHex:        "0000000000004567",
+			baseKeyHex:    "000102030405060708090a0b0c0d0e0f",
+			metadataHex:   "4945544620534672616d65205747",
+			plaintextHex:  "64726166742d696574662d736672616d652d656e63",
+			ciphertextHex: "9901234567449408b6f490086165b9d6f62b24ae1a59a56486b4ae8ed036b88912e24f11",
+		},
+		{
+			cipherSuite:   0x0002,
+			kidHex:        "0000000000000123",
+			ctrHex:        "0000000000004567",
+			baseKeyHex:    "000102030405060708090a0b0c0d0e0f",
+			metadataHex:   "4945544620534672616d65205747",
+			plaintextHex:  "64726166742d696574662d736672616d652d656e63",
+			ciphertextHex: "99012345673f31438db4d09434e43afa0f8a2f00867a2be085046a9f5cb4f101d607",
+		},
+		{
+			cipherSuite:   0x0003,
+			kidHex:        "0000000000000123",
+			ctrHex:        "0000000000004567",
+			baseKeyHex:    "000102030405060708090a0b0c0d0e0f",
+			metadataHex:   "4945544620534672616d65205747",
+			plaintextHex:  "64726166742d696574662d736672616d652d656e63",
+			ciphertextHex: "990123456717fc8af28a5a695afcfc6c8df6358a17e26b2fcb3bae32e443",
+		},
+		{
+			cipherSuite:   0x0004,
+			kidHex:        "0000000000000123",
+			ctrHex:        "0000000000004567",
+			baseKeyHex:    "000102030405060708090a0b0c0d0e0f",
+			metadataHex:   "4945544620534672616d65205747",
+			plaintextHex:  "64726166742d696574662d736672616d652d656e63",
+			ciphertextHex: "9901234567b7412c2513a1b66dbb48841bbaf17f598751176ad847681a69c6d0b091c07018ce4adb34eb",
+		},
+		{
+			cipherSuite:   0x0005,
+			kidHex:        "0000000000000123",
+			ctrHex:        "0000000000004567",
+			baseKeyHex:    "000102030405060708090a0b0c0d0e0f",
+			metadataHex:   "4945544620534672616d65205747",
+			plaintextHex:  "64726166742d696574662d736672616d652d656e63",
+			ciphertextHex: "990123456794f509d36e9beacb0e261d99c7d1e972f1fed787d4049f17ca21353c1cc24d56ceabced279",
+		},
 	}
 
-	sframeCiphertext, err := sframer.Encrypt(ctr, kid, metadata, plaintext)
-	require.Nil(t, err, "SFramer encrypt failed")
-	require.Equal(t, sframeCiphertext, ciphertext, "SFramer encryption ciphertext mismatch")
+	for _, vector := range testVectors {
+		kid := mustDecodeHexInt(vector.kidHex)
+		ctr := mustDecodeHexInt(vector.ctrHex)
+		baseKey := mustDecodeHex(vector.baseKeyHex)
+		metadata := mustDecodeHex(vector.metadataHex)
+		plaintext := mustDecodeHex(vector.plaintextHex)
+		ciphertext := mustDecodeHex(vector.ciphertextHex)
+
+		suite, err := NewCiphersuite(vector.cipherSuite)
+		if err == nil {
+			var err error
+			kidMap := make(map[uint64]SFramerKey)
+			kidMap[kid], err = NewSFramerKey(kid, baseKey, suite)
+			require.Nil(t, err, "NewSFramerKey failed")
+			sframer := SFramer{
+				suite:    suite,
+				keyStore: kidMap,
+			}
+
+			sframeCiphertext, err := sframer.Encrypt(ctr, kid, metadata, plaintext)
+			require.Nil(t, err, "SFramer encrypt failed")
+			require.Equal(t, sframeCiphertext, ciphertext, "SFramer encryption ciphertext mismatch")
+		} else {
+			t.Logf("unsupported ciphersuite: %x\n", vector.cipherSuite)
+		}
+	}
 }
