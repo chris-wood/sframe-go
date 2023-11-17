@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"io"
 
 	"golang.org/x/crypto/hkdf"
@@ -104,6 +105,39 @@ func decodeHeader(header []byte) (uint64, uint64, int) {
 	return kid, ctr, 1 + kidLen + ctrLen
 }
 
+type Ciphersuite interface {
+	AEAD() Encryptor
+	Hash() func() hash.Hash
+	ID() uint16
+}
+
+func NewCiphersuite(id uint16) (Ciphersuite, error) {
+	if id == 0x0001 {
+		return AesCtr128HmacSha256Tag80Suite{}, nil
+	} else if id == 0x0002 {
+		return AesCtr128HmacSha256Tag64Suite{}, nil
+	} else if id == 0x0003 {
+		return AesCtr128HmacSha256Tag32Suite{}, nil
+	} else {
+		return nil, fmt.Errorf("unsupported ciphersuite")
+	}
+}
+
+type AesCtr128HmacSha256Tag80Suite struct {
+}
+
+func (s AesCtr128HmacSha256Tag80Suite) AEAD() Encryptor {
+	return AesCtr128HmacSha256Tag80Encryptor{}
+}
+
+func (s AesCtr128HmacSha256Tag80Suite) Hash() func() hash.Hash {
+	return sha256.New
+}
+
+func (s AesCtr128HmacSha256Tag80Suite) ID() uint16 {
+	return 0x0001
+}
+
 type Encryptor interface {
 	Encrypt(key, nonce, aad, plaintext []byte) ([]byte, error)
 	Decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error)
@@ -116,18 +150,17 @@ type Encryptor interface {
 type AesCtr128HmacSha256Tag80Encryptor struct {
 }
 
-func (e AesCtr128HmacSha256Tag80Encryptor) deriveSubkeys(sframeKey []byte) ([]byte, []byte) {
+func deriveAesCtrHmacSubkeys(sframeKey []byte, nka int) ([]byte, []byte) {
 	// def derive_subkeys(sframe_key):
 	//   enc_key = sframe_key[..Nka]
 	//   auth_key = sframe_key[Nka..]
 	//   return enc_key, auth_key
-	Nka := 16
-	encKey := sframeKey[:Nka]
-	authKey := sframeKey[Nka:]
+	encKey := sframeKey[:nka]
+	authKey := sframeKey[nka:]
 	return encKey, authKey
 }
 
-func (e AesCtr128HmacSha256Tag80Encryptor) computeTag(authKey, nonce, aad, ct []byte) []byte {
+func computeAesCtrHmacTag(authKey, nonce, aad, ct []byte, nt int) []byte {
 	// def compute_tag(auth_key, nonce, aad, ct):
 	//   aad_len = encode_big_endian(len(aad), 8)
 	//   ct_len = encode_big_endian(len(ct), 8)
@@ -138,7 +171,7 @@ func (e AesCtr128HmacSha256Tag80Encryptor) computeTag(authKey, nonce, aad, ct []
 
 	aadLen := encodeBigEndian(uint64(len(aad)), 8)
 	ctLen := encodeBigEndian(uint64(len(ct)), 8)
-	tagLen := encodeBigEndian(uint64(e.Nt()), 8)
+	tagLen := encodeBigEndian(uint64(nt), 8)
 
 	authData := append(aadLen, ctLen...)
 	authData = append(authData, tagLen...)
@@ -150,7 +183,26 @@ func (e AesCtr128HmacSha256Tag80Encryptor) computeTag(authKey, nonce, aad, ct []
 	mac.Write(authData)
 	tag := mac.Sum(nil)
 
-	return tag[:e.Nt()]
+	return tag[:nt]
+}
+
+func (e AesCtr128HmacSha256Tag80Encryptor) computeTag(authKey, nonce, aad, ct []byte) []byte {
+	return computeAesCtrHmacTag(authKey, nonce, aad, ct, e.Nt())
+}
+
+func counterEncrypt(nonce, key, plaintext []byte) ([]byte, error) {
+	fourZeroes := make([]byte, 4)
+	iv := append(nonce, fourZeroes...)
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	ctr := cipher.NewCTR(block, iv)
+	ciphertext := make([]byte, len(plaintext))
+	ctr.XORKeyStream(ciphertext, plaintext)
+
+	return ciphertext, nil
 }
 
 func (e AesCtr128HmacSha256Tag80Encryptor) Encrypt(key, nonce, aad, plaintext []byte) ([]byte, error) {
@@ -161,20 +213,12 @@ func (e AesCtr128HmacSha256Tag80Encryptor) Encrypt(key, nonce, aad, plaintext []
 	//   tag = compute_tag(auth_key, nonce, aad, ct)
 	//   return ct + tag
 
-	encKey, authKey := e.deriveSubkeys(key)
-
-	fourZeroes := make([]byte, 4)
-	iv := append(nonce, fourZeroes...)
-
-	block, err := aes.NewCipher(encKey)
+	encKey, authKey := deriveAesCtrHmacSubkeys(key, 16)
+	ciphertext, err := counterEncrypt(nonce, encKey, plaintext)
 	if err != nil {
 		return nil, err
 	}
-	ctr := cipher.NewCTR(block, iv)
-	ciphertext := make([]byte, len(plaintext))
-	ctr.XORKeyStream(ciphertext, plaintext)
-
-	tag := e.computeTag(authKey, nonce, aad, ciphertext)
+	tag := computeAesCtrHmacTag(authKey, nonce, aad, ciphertext, e.Nt())
 
 	return append(ciphertext, tag...), nil
 }
@@ -194,22 +238,16 @@ func (e AesCtr128HmacSha256Tag80Encryptor) Decrypt(key, nonce, aad, ciphertext [
 	innerCiphertext := ciphertext[:len(ciphertext)-e.Nt()]
 	tag := ciphertext[len(ciphertext)-e.Nt():]
 
-	encKey, authKey := e.deriveSubkeys(key)
-	candidateTag := e.computeTag(authKey, nonce, aad, innerCiphertext)
+	encKey, authKey := deriveAesCtrHmacSubkeys(key, 16)
+	candidateTag := computeAesCtrHmacTag(authKey, nonce, aad, innerCiphertext, e.Nt())
 	if subtle.ConstantTimeCompare(tag, candidateTag) == 0 {
 		return nil, fmt.Errorf("decrypt tag verification failed")
 	}
 
-	fourZeroes := make([]byte, 4)
-	iv := append(nonce, fourZeroes...)
-
-	block, err := aes.NewCipher(encKey)
+	plaintext, err := counterEncrypt(nonce, encKey, innerCiphertext)
 	if err != nil {
 		return nil, err
 	}
-	ctr := cipher.NewCTR(block, iv)
-	plaintext := make([]byte, len(innerCiphertext))
-	ctr.XORKeyStream(plaintext, innerCiphertext)
 
 	return plaintext, nil
 }
@@ -226,12 +264,136 @@ func (e AesCtr128HmacSha256Tag80Encryptor) Nt() int {
 	return 10
 }
 
+type AesCtr128HmacSha256Tag64Suite struct {
+}
+
+// https://sframe-wg.github.io/sframe/draft-ietf-sframe-enc.html#name-cipher-suites
+type AesCtr128HmacSha256Tag64Encryptor struct {
+}
+
+func (s AesCtr128HmacSha256Tag64Suite) AEAD() Encryptor {
+	return AesCtr128HmacSha256Tag64Encryptor{}
+}
+
+func (s AesCtr128HmacSha256Tag64Suite) Hash() func() hash.Hash {
+	return sha256.New
+}
+
+func (s AesCtr128HmacSha256Tag64Suite) ID() uint16 {
+	return 0x0002
+}
+
+func (e AesCtr128HmacSha256Tag64Encryptor) Encrypt(key, nonce, aad, plaintext []byte) ([]byte, error) {
+	encKey, authKey := deriveAesCtrHmacSubkeys(key, 16)
+
+	ciphertext, err := counterEncrypt(nonce, encKey, plaintext)
+	if err != nil {
+		return nil, err
+	}
+
+	tag := computeAesCtrHmacTag(authKey, nonce, aad, ciphertext, e.Nt())
+
+	return append(ciphertext, tag...), nil
+}
+
+func (e AesCtr128HmacSha256Tag64Encryptor) Decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error) {
+	innerCiphertext := ciphertext[:len(ciphertext)-e.Nt()]
+	tag := ciphertext[len(ciphertext)-e.Nt():]
+
+	encKey, authKey := deriveAesCtrHmacSubkeys(key, 16)
+	candidateTag := computeAesCtrHmacTag(authKey, nonce, aad, innerCiphertext, e.Nt())
+	if subtle.ConstantTimeCompare(tag, candidateTag) == 0 {
+		return nil, fmt.Errorf("decrypt tag verification failed")
+	}
+
+	plaintext, err := counterEncrypt(nonce, encKey, innerCiphertext)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
+}
+
+func (e AesCtr128HmacSha256Tag64Encryptor) Nk() int {
+	return 48
+}
+
+func (e AesCtr128HmacSha256Tag64Encryptor) Nn() int {
+	return 12
+}
+
+func (e AesCtr128HmacSha256Tag64Encryptor) Nt() int {
+	return 8
+}
+
+type AesCtr128HmacSha256Tag32Suite struct {
+}
+
+// https://sframe-wg.github.io/sframe/draft-ietf-sframe-enc.html#name-cipher-suites
+type AesCtr128HmacSha256Tag32Encryptor struct {
+}
+
+func (s AesCtr128HmacSha256Tag32Suite) AEAD() Encryptor {
+	return AesCtr128HmacSha256Tag32Encryptor{}
+}
+
+func (s AesCtr128HmacSha256Tag32Suite) Hash() func() hash.Hash {
+	return sha256.New
+}
+
+func (s AesCtr128HmacSha256Tag32Suite) ID() uint16 {
+	return 0x0003
+}
+
+func (e AesCtr128HmacSha256Tag32Encryptor) Encrypt(key, nonce, aad, plaintext []byte) ([]byte, error) {
+	encKey, authKey := deriveAesCtrHmacSubkeys(key, 16)
+
+	ciphertext, err := counterEncrypt(nonce, encKey, plaintext)
+	if err != nil {
+		return nil, err
+	}
+
+	tag := computeAesCtrHmacTag(authKey, nonce, aad, ciphertext, e.Nt())
+
+	return append(ciphertext, tag...), nil
+}
+
+func (e AesCtr128HmacSha256Tag32Encryptor) Decrypt(key, nonce, aad, ciphertext []byte) ([]byte, error) {
+	innerCiphertext := ciphertext[:len(ciphertext)-e.Nt()]
+	tag := ciphertext[len(ciphertext)-e.Nt():]
+
+	encKey, authKey := deriveAesCtrHmacSubkeys(key, 16)
+	candidateTag := computeAesCtrHmacTag(authKey, nonce, aad, innerCiphertext, e.Nt())
+	if subtle.ConstantTimeCompare(tag, candidateTag) == 0 {
+		return nil, fmt.Errorf("decrypt tag verification failed")
+	}
+
+	plaintext, err := counterEncrypt(nonce, encKey, innerCiphertext)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
+}
+
+func (e AesCtr128HmacSha256Tag32Encryptor) Nk() int {
+	return 48
+}
+
+func (e AesCtr128HmacSha256Tag32Encryptor) Nn() int {
+	return 12
+}
+
+func (e AesCtr128HmacSha256Tag32Encryptor) Nt() int {
+	return 4
+}
+
 type SFramerKey struct {
 	key  []byte
 	salt []byte
 }
 
-func NewSFramerKey(kid uint64, baseKey []byte, e Encryptor) (SFramerKey, error) {
+func NewSFramerKey(kid uint64, baseKey []byte, s Ciphersuite) (SFramerKey, error) {
 	// def derive_key_salt(KID, base_key):
 	// 	sframe_secret = HKDF-Extract("", base_key)
 	// 	info = "SFrame 1.0 Secret key " + KID + cipher_suite
@@ -239,19 +401,18 @@ func NewSFramerKey(kid uint64, baseKey []byte, e Encryptor) (SFramerKey, error) 
 	// 	sframe_salt = HKDF-Expand(sframe_secret, info, AEAD.Nn)
 	// 	return sframe_key, sframe_salt
 
-	// XXX(caw): get HKDF from the ciphersuite
-	hash := sha256.New
-	infoSuffix := append(encodeBigEndian(kid, 8), encodeBigEndian(0x0001, 2)...)
+	hash := s.Hash()
+	infoSuffix := append(encodeBigEndian(kid, 8), encodeBigEndian(uint64(s.ID()), 2)...)
 
 	keyInfo := append([]byte("SFrame 1.0 Secret key "), infoSuffix...)
 	keyReader := hkdf.New(hash, baseKey, nil, keyInfo)
-	sframeKey := make([]byte, e.Nk())
+	sframeKey := make([]byte, s.AEAD().Nk())
 	if _, err := io.ReadFull(keyReader, sframeKey); err != nil {
 		return SFramerKey{}, err
 	}
 	saltInfo := append([]byte("SFrame 1.0 Secret salt "), infoSuffix...)
 	saltReader := hkdf.New(hash, baseKey, nil, saltInfo)
-	sframeSalt := make([]byte, e.Nn())
+	sframeSalt := make([]byte, s.AEAD().Nn())
 	if _, err := io.ReadFull(saltReader, sframeSalt); err != nil {
 		return SFramerKey{}, err
 	}
@@ -263,8 +424,8 @@ func NewSFramerKey(kid uint64, baseKey []byte, e Encryptor) (SFramerKey, error) 
 }
 
 type SFramer struct {
-	encryptor Encryptor
-	keyStore  map[uint64]SFramerKey
+	suite    Ciphersuite
+	keyStore map[uint64]SFramerKey
 }
 
 func xor(a, b []byte) []byte {
@@ -287,7 +448,7 @@ func (f SFramer) Encrypt(ctr uint64, kid uint64, metadata []byte, plaintext []by
 	}
 
 	//   ctr = encode_big_endian(CTR, AEAD.Nn)
-	encodedCtr := encodeBigEndian(ctr, f.encryptor.Nn())
+	encodedCtr := encodeBigEndian(ctr, f.suite.AEAD().Nn())
 
 	//   nonce = xor(sframe_salt, CTR)
 	nonce := xor(sframerKey.salt, encodedCtr)
@@ -299,7 +460,7 @@ func (f SFramer) Encrypt(ctr uint64, kid uint64, metadata []byte, plaintext []by
 	aad := append(header, metadata...)
 
 	// ciphertext = AEAD.Encrypt(sframe_key, nonce, aad, plaintext)
-	ciphertext, err := f.encryptor.Encrypt(sframerKey.key, nonce, aad, plaintext)
+	ciphertext, err := f.suite.AEAD().Encrypt(sframerKey.key, nonce, aad, plaintext)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +483,7 @@ func (f SFramer) Decrypt(metadata []byte, sframeCiphertext []byte) ([]byte, erro
 	}
 
 	// 	ctr = encode_big_endian(CTR, AEAD.Nn)
-	encodedCtr := encodeBigEndian(ctr, f.encryptor.Nn())
+	encodedCtr := encodeBigEndian(ctr, f.suite.AEAD().Nn())
 
 	// 	nonce = xor(sframe_salt, ctr)
 	nonce := xor(sframerKey.salt, encodedCtr)
@@ -331,7 +492,7 @@ func (f SFramer) Decrypt(metadata []byte, sframeCiphertext []byte) ([]byte, erro
 	aad := append(header, metadata...)
 
 	// 	return AEAD.Decrypt(sframe_key, nonce, aad, ciphertext)
-	plaintext, err := f.encryptor.Decrypt(sframerKey.key, nonce, aad, ciphertext)
+	plaintext, err := f.suite.AEAD().Decrypt(sframerKey.key, nonce, aad, ciphertext)
 	if err != nil {
 		return nil, err
 	}
