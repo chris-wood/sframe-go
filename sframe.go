@@ -13,7 +13,7 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-func numBytes(x int) int {
+func numBytes(x uint64) int {
 	count := 0
 	for {
 		if x > 0 {
@@ -26,7 +26,7 @@ func numBytes(x int) int {
 	return (count + 7) / 8
 }
 
-func encodeBigEndian(x int, n int) []byte {
+func encodeBigEndian(x uint64, n int) []byte {
 	if n == 8 {
 		buffer := make([]byte, 8)
 		binary.BigEndian.PutUint64(buffer, uint64(x))
@@ -35,16 +35,18 @@ func encodeBigEndian(x int, n int) []byte {
 		buffer := make([]byte, 2)
 		binary.BigEndian.PutUint16(buffer, uint16(x))
 		return buffer
-	} else {
+	} else if n > 8 {
 		// XXX(caw): this doesn't handle counters larger than 2^64
 		buffer := make([]byte, 8)
 		binary.BigEndian.PutUint64(buffer, uint64(x))
 		zeroes := make([]byte, n-8)
 		return append(zeroes, buffer...)
+	} else {
+		panic("unsupported (lazy programmer)")
 	}
 }
 
-func encodeHeader(kid int, ctr int) []byte {
+func encodeHeader(kid uint64, ctr uint64) []byte {
 	kidBuffer := []byte{}
 	ctrBuffer := []byte{}
 	headerPrefix := byte(0)
@@ -65,7 +67,7 @@ func encodeHeader(kid int, ctr int) []byte {
 		ctrBuffer = make([]byte, 8)
 		binary.BigEndian.PutUint64(ctrBuffer, uint64(ctr))
 		ctrBuffer = ctrBuffer[(8 - ctrBytes):]
-		headerPrefix |= 0x8
+		headerPrefix |= 0x08
 		headerPrefix |= uint8(ctrBytes) - 1
 	}
 	header := []byte{headerPrefix}
@@ -75,28 +77,28 @@ func encodeHeader(kid int, ctr int) []byte {
 	return header
 }
 
-func decodeHeader(header []byte) (int, int, int) {
-	kid := 0
+func decodeHeader(header []byte) (uint64, uint64, int) {
+	kid := uint64(0)
 	kidLen := 0
-	ctr := 0
+	ctr := uint64(0)
 	ctrLen := 0
 	if header[0]&0x80 == 0 {
-		kid = int((header[0] & 0x70) >> 4)
+		kid = uint64((header[0] & 0x70) >> 4)
 	} else {
 		kidLen = int((header[0]&0x70)>>4) + 1
 		buffer := make([]byte, 8)
 		kidBuffer := header[1 : 1+kidLen]
 		copy(buffer[8-kidLen:], kidBuffer)
-		kid = int(binary.BigEndian.Uint64(buffer))
+		kid = binary.BigEndian.Uint64(buffer)
 	}
 	if header[0]&0x8 == 0 {
-		ctr = int(header[0] & 0x7)
+		ctr = uint64(header[0] & 0x7)
 	} else {
 		ctrLen = int(header[0]&0x7) + 1
 		buffer := make([]byte, 8)
 		ctrBuffer := header[1+kidLen : 1+kidLen+ctrLen]
 		copy(buffer[8-ctrLen:], ctrBuffer)
-		ctr = int(binary.BigEndian.Uint64(buffer))
+		ctr = binary.BigEndian.Uint64(buffer)
 	}
 
 	return kid, ctr, 1 + kidLen + ctrLen
@@ -112,7 +114,6 @@ type Encryptor interface {
 
 // https://sframe-wg.github.io/sframe/draft-ietf-sframe-enc.html#name-cipher-suites
 type AesCtr128HmacSha256Tag80Encryptor struct {
-	// baseKey []byte
 }
 
 func (e AesCtr128HmacSha256Tag80Encryptor) deriveSubkeys(sframeKey []byte) ([]byte, []byte) {
@@ -135,9 +136,9 @@ func (e AesCtr128HmacSha256Tag80Encryptor) computeTag(authKey, nonce, aad, ct []
 	//   tag = HMAC(auth_key, auth_data)
 	//   return truncate(tag, Nt)
 
-	aadLen := encodeBigEndian(len(aad), 8)
-	ctLen := encodeBigEndian(len(ct), 8)
-	tagLen := encodeBigEndian(e.Nt(), 8)
+	aadLen := encodeBigEndian(uint64(len(aad)), 8)
+	ctLen := encodeBigEndian(uint64(len(ct)), 8)
+	tagLen := encodeBigEndian(uint64(e.Nt()), 8)
 
 	authData := append(aadLen, ctLen...)
 	authData = append(authData, tagLen...)
@@ -230,7 +231,7 @@ type SFramerKey struct {
 	salt []byte
 }
 
-func NewSFramerKey(kid int, baseKey []byte, e Encryptor) SFramerKey {
+func NewSFramerKey(kid uint64, baseKey []byte, e Encryptor) (SFramerKey, error) {
 	// def derive_key_salt(KID, base_key):
 	// 	sframe_secret = HKDF-Extract("", base_key)
 	// 	info = "SFrame 1.0 Secret key " + KID + cipher_suite
@@ -246,24 +247,24 @@ func NewSFramerKey(kid int, baseKey []byte, e Encryptor) SFramerKey {
 	keyReader := hkdf.New(hash, baseKey, nil, keyInfo)
 	sframeKey := make([]byte, e.Nk())
 	if _, err := io.ReadFull(keyReader, sframeKey); err != nil {
-		panic(err)
+		return SFramerKey{}, err
 	}
 	saltInfo := append([]byte("SFrame 1.0 Secret salt "), infoSuffix...)
 	saltReader := hkdf.New(hash, baseKey, nil, saltInfo)
 	sframeSalt := make([]byte, e.Nn())
 	if _, err := io.ReadFull(saltReader, sframeSalt); err != nil {
-		panic(err)
+		return SFramerKey{}, err
 	}
 
 	return SFramerKey{
 		key:  sframeKey,
 		salt: sframeSalt,
-	}
+	}, nil
 }
 
 type SFramer struct {
 	encryptor Encryptor
-	keyStore  map[int]SFramerKey
+	keyStore  map[uint64]SFramerKey
 }
 
 func xor(a, b []byte) []byte {
@@ -277,7 +278,7 @@ func xor(a, b []byte) []byte {
 	return c
 }
 
-func (f SFramer) Encrypt(ctr int, kid int, metadata []byte, plaintext []byte) ([]byte, error) {
+func (f SFramer) Encrypt(ctr uint64, kid uint64, metadata []byte, plaintext []byte) ([]byte, error) {
 	// def encrypt(CTR, KID, metadata, plaintext):
 	//   sframe_key, sframe_salt = key_store[KID]
 	sframerKey, ok := f.keyStore[kid]

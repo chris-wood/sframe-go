@@ -3,6 +3,8 @@ package sframe
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -16,47 +18,33 @@ func mustDecodeHex(x string) []byte {
 	return val
 }
 
-func mustDecodeHexInt(x string) int {
+func mustDecodeHexInt(x string) uint64 {
 	v := mustDecodeHex(x)
-	return int(binary.BigEndian.Uint64(v))
+	return binary.BigEndian.Uint64(v)
+}
+
+type HeaderTestVector struct {
+	Kid    string `json:"kid"`
+	Ctr    string `json:"ctr"`
+	Header string `json:"header"`
 }
 
 // https://sframe-wg.github.io/sframe/draft-ietf-sframe-enc.html#name-header-encoding-decoding
 func TestHeaderEncode(t *testing.T) {
-	var testVectors = []struct {
-		kidHex    string
-		ctrHex    string
-		headerHex string
-	}{
-		{
-			kidHex:    "0000000000000000",
-			ctrHex:    "0000000000000000",
-			headerHex: "00",
-		},
-		{
-			kidHex:    "0000000000000000",
-			ctrHex:    "00000000ffffffff",
-			headerHex: "0bffffffff",
-		},
-		{
-			kidHex:    "0000000000000100",
-			ctrHex:    "0000000000000000",
-			headerHex: "900100",
-		},
-		{
-			kidHex:    "0000000000000100",
-			ctrHex:    "000000ffffffffff",
-			headerHex: "9c0100ffffffffff",
-		},
+	var testVectors []HeaderTestVector
+	testVectorBytes, err := os.ReadFile("header_test_vectors.json")
+	require.Nil(t, err, "Failed reading test vectors")
+	if err := json.Unmarshal(testVectorBytes, &testVectors); err != nil {
+		require.Nil(t, err, "Failed parsing test vectors")
 	}
 
 	for _, vector := range testVectors {
-		kidBytes := mustDecodeHex(vector.kidHex)
-		ctrBytes := mustDecodeHex(vector.ctrHex)
-		headerBytes := mustDecodeHex(vector.headerHex)
+		kidBytes := mustDecodeHex(vector.Kid)
+		ctrBytes := mustDecodeHex(vector.Ctr)
+		headerBytes := mustDecodeHex(vector.Header)
 
-		kid := int(binary.BigEndian.Uint64(kidBytes))
-		ctr := int(binary.BigEndian.Uint64(ctrBytes))
+		kid := binary.BigEndian.Uint64(kidBytes)
+		ctr := binary.BigEndian.Uint64(ctrBytes)
 
 		header := encodeHeader(kid, ctr)
 		require.Equal(t, headerBytes, header)
@@ -122,8 +110,10 @@ func TestSFrameRoundTrip(t *testing.T) {
 
 	encryptor := AesCtr128HmacSha256Tag80Encryptor{}
 
-	kidMap := make(map[int]SFramerKey)
-	kidMap[kid] = NewSFramerKey(kid, baseKey, encryptor)
+	var err error
+	kidMap := make(map[uint64]SFramerKey)
+	kidMap[kid], err = NewSFramerKey(kid, baseKey, encryptor)
+	require.Nil(t, err, "NewSFramerKey failed")
 	sframer := SFramer{
 		encryptor: encryptor,
 		keyStore:  kidMap,
